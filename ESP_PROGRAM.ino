@@ -31,6 +31,7 @@
 #define I_AM_OPERATER_VOICE 2     //「オペレータです」再生
 #define CHANGE_OPERATER_VOICE 3   //「オペレータに代わります」再生
 #define SEND_VOICE 4              //「送信しました」再生
+#define TIMING_MUSIC 5            //心臓マッサージタイミングの支援音
 
 /*-------GPS情報に関する設定-------*/
 #define READ_GPS 6              //読み取りバイト数
@@ -49,11 +50,11 @@
 #define INT_ENABLE 0x2e     //INT_ENABLEのアドレス
 
 /*-------ネットワークに関する設定-------*/
-const IPAddress my_ip(192, 168, 1, 100);        //ESP-WROOM-02のIPアドレス
-const IPAddress server_ip(192, 168, 1, 150);    //管理サーバのIPアドレス
-const IPAddress gateway(192,168, 1, 1);         //デフォルトゲートウェイ
+const IPAddress my_ip(192, 168, 128, 200);        //ESP-WROOM-02のIPアドレス
+const IPAddress server_ip(192, 168, 128, 100);    //管理サーバのIPアドレス
+const IPAddress gateway(192,168, 128, 1);         //デフォルトゲートウェイ
 const IPAddress subnetmask(255, 255, 255, 0);   //サブネットマスク
-const IPAddress dns_ip(192, 168, 1, 1);         //DNSサーバのIPアドレス
+const IPAddress dns_ip(192, 168, 128, 1);         //DNSサーバのIPアドレス
 
 //wifiのパスワードとか
 const char* ssid = WIFI_SSID;
@@ -79,6 +80,9 @@ SoftwareSerial music_serial(SWSERIAL_RX_PIN, SWSERIAL_TX_PIN);
 //加速度センサのデバイスアドレス(スレーブ)
 uint8_t ADXL_ADDRESS = 0x53; 
 
+//定周期タイマー割込み回数カウント用
+volatile int polling_counter = 0;
+
 //計測データ格納用変数
 String node_id;       //ノードID格納用
 String longtitude;    //経度情報格納用
@@ -92,117 +96,6 @@ volatile boolean exe_flag = false;      //実行フラグ（true：蓋開状態�
 volatile boolean impact_flag = false;   //衝撃検知割込みフラグ
 volatile boolean polling_flag = false;  //定周期タイマー割込みフラグ
 /*-------ここまでその他の設定および変数群*/
-
-
-/*-------ここから割込みに関する関数-------*/
-//（1）衝撃検知割込みシーケンス（加速度センサからの外部割込みで起動）
-void ICACHE_RAM_ATTR impact_interrupt(){
-  impact_flag = true;     //衝撃検知割込みフラグを立てる
-    
-  return;
-}
-
-
-//（2）定周期タイマー割込みシーケンス（10秒経過ごとに起動）
-void polling_interrupt(){
-  polling_flag = true;    //定周期タイマー割込みフラグを立てる
-
-  return;
-}
-/*-------ここまで割込みに関する関数-------*/
-
-
-/*-------ここからESP-WROOM-02本体に関する関数-------*/
-//ESP-WROOM-02の初期設定シーケンス
-void setup() {
-  //ハードウェアUART開始する
-  Serial.begin(UART_SPEED);
-
-  //ソフトウェアUART開始する
-  music_serial.begin(UART_SPEED); 
-
-  //ファイル入出力インタフェース開始する
-  SPIFFS.begin();
-
-  //WiFi接続シーケンスを起動する
-  wifi_connection();
-
-  //ピンのモードを設定する
-  pinMode(ADXL_INTERRUPT_PIN, INPUT_PULLUP);
-  pinMode(SW_INTERRUPT_PIN, INPUT);
-
-  //割込みを受けたときのハンドラを登録する
-  attachInterrupt(digitalPinToInterrupt(ADXL_INTERRUPT_PIN), impact_interrupt, RISING);   //衝撃検知割込みシーケンス
-
-  //定周期タイマー割込みを受けたときのハンドラを登録する
-  periodic_interrupt.attach_ms(POLLING_PERIOD, polling_interrupt);   //定周期タイマー割込みシーケンス
-
-  //ノードIDと前回の位置情報をテキストファイルから読み取る
-  File read_file = SPIFFS.open(data_file, "r");
-  node_id = read_file.readStringUntil('\n');       //ノードID
-  node_id.trim();
-  longtitude = read_file.readStringUntil('\n');    //前回の最終経度情報
-  longtitude.trim();
-  latitude = read_file.readStringUntil('\n');      //前回の最終緯度情報
-  latitude.trim();
-  read_file.close();
-
-  //加速度センサ初期化シーケンスを実行する
-  set_adxl_resister();
-
-  //DFPlayer Miniとの通信設定，音量設定を行う
-  mp3_set_serial (music_serial);
-  mp3_set_volume (MUSIC_VOLUME);
-
-  return;
-}
-
-
-//ESP-WROOM-02のループシーケンス
-void loop() {
-
-  //蓋開閉検知スイッチがON・衝撃検知フラグがON・実行フラグがON
-  if(digitalRead(SW_INTERRUPT_PIN) == HIGH && impact_flag == true && exe_flag == false){
-    exe_flag = true;                                       //実行フラグを立てる
-    http_access(node_id, longtitude, latitude, "START");   //前回記録した最終位置情報を送信する
-    impact_flag = false;                                   //衝撃検知フラグを折る
-  }
-
-  //蓋開閉検知スイッチがOFF・実行フラグがON
-  if(digitalRead(SW_INTERRUPT_PIN) == LOW && exe_flag == true){
-    exe_flag = false;                                      //実行フラグを折る
-    http_access(node_id, longtitude, latitude, "END");     //今回記録した最終位置情報を送信する
-    
-    //ノードIDと前回の最終位置情報をテキストファイルに書き込む
-    File write_file = SPIFFS.open(data_file, "w");
-    write_file.println(node_id);
-    write_file.println(longtitude);
-    write_file.print(latitude);
-    write_file.close();    
-  }
-
-  //定周期タイマー割込みフラグがON・実行フラグがON
-  if(polling_flag == true && exe_flag == true){
-    http_access(node_id, longtitude, latitude, "POLLING");   //位置情報を送信する
-    polling_flag = false;                                    //定周期タイマー割込みフラグを折る
-  }
-  
-  //GPS信号の受信処理
-  while(Serial.available() > 0){
-    if(gps.encode(Serial.read())){                           //読み込んだデータをエンコードする
-      if(gps.location.isValid()){                             //有効な位置情報か判断する
-        latitude = String(gps.location.lat(), READ_GPS);      //緯度情報を取得
-        longtitude = String(gps.location.lng(), READ_GPS);    //経度情報を取得        
-      }
-    }
-  }
-
-  //加速度センサの割込みフラグを定期リセットする
-  Wire.requestFrom(ADXL_ADDRESS, READ_ADXL);
-  
-  return;
-}
-/*-------ここまでESP-WROOM-02本体に関する関数-------*/
 
 
 /*-------以下、自作関数-------*/
@@ -227,7 +120,7 @@ void wifi_connection(){
 
 
 //HTTP通信シーケンス
-void http_access(String id, String lon, String lati, String type){
+void http_access(String id, String lon, String lati, String type, boolean music_flag){
   //HTTP通信を行うためのインスタンス
   HTTPClient http;
   
@@ -245,21 +138,25 @@ void http_access(String id, String lon, String lati, String type){
   //送信データの情報を組み立てる
   String post_param = "node_id=";
   post_param.concat(id);             //ノードID
-  post_param.concat("& long_data=");
+  post_param.concat("&long_data=");
   post_param.concat(lon);            //経度情報
-  post_param.concat("& lat_data=");
+  post_param.concat("&lat_data=");
   post_param.concat(lati);           //緯度情報
-  post_param.concat("& type=");
+  post_param.concat("&type=");
   post_param.concat(type);           //送信事由情報
 
   //POST通信を開始する
   int http_code = http.POST(post_param);
 
-  //通信結果を音声報告する
+  //音声再生フラグが立っていれば、通信結果を音声報告する
   if(http_code == 200){
-    play_voice(SEND_VOICE);     //通信成功「送信しました」
+    if(music_flag == true){
+      play_voice(SEND_VOICE);     //通信成功「送信しました」
+    }
   }else{
-    play_voice(ERROR_VOICE);    //通信失敗「エラーが発生しました」
+    if(music_flag == true){
+      play_voice(ERROR_VOICE);    //通信失敗「エラーが発生しました」
+    }
   }
   delay(1);
   
@@ -316,3 +213,127 @@ void play_voice(int number){
 
   return;
 }
+/*-------ここまで自作関数-------*/
+
+
+/*-------ここから割込みに関する関数-------*/
+//（1）衝撃検知割込みシーケンス（加速度センサからの外部割込みで起動）
+void ICACHE_RAM_ATTR impact_interrupt(){
+  impact_flag = true;     //衝撃検知割込みフラグを立てる
+    
+  return;
+}
+
+
+//（2）定周期タイマー割込みシーケンス（10秒経過ごとに起動）
+void polling_interrupt(){
+  polling_flag = true;    //定周期タイマー割込みフラグを立てる
+  polling_counter++;      //ポーリングカウンタをインクリメントする
+  return;
+}
+/*-------ここまで割込みに関する関数-------*/
+
+
+/*-------ここからESP-WROOM-02本体に関する関数-------*/
+//ESP-WROOM-02の初期設定シーケンス
+void setup() {
+  //ハードウェアUART開始する
+  Serial.begin(UART_SPEED);
+
+  //ソフトウェアUART開始する
+  music_serial.begin(UART_SPEED); 
+
+  //ファイル入出力インタフェース開始する
+  SPIFFS.begin();
+
+  //WiFi接続シーケンスを起動する
+  wifi_connection();
+
+  //ピンのモードを設定する
+  pinMode(ADXL_INTERRUPT_PIN, INPUT_PULLUP);
+  pinMode(SW_INTERRUPT_PIN, INPUT);
+
+  //外部割込みを受けたときのハンドラを登録する
+  attachInterrupt(digitalPinToInterrupt(ADXL_INTERRUPT_PIN), impact_interrupt, RISING);   //衝撃検知割込みシーケンス
+
+  //定周期タイマー割込みを受けたときのハンドラを登録する
+  periodic_interrupt.attach_ms(POLLING_PERIOD, polling_interrupt);   //定周期タイマー割込みシーケンス
+
+  //ノードIDと前回の位置情報をテキストファイルから読み取る
+  File read_file = SPIFFS.open(data_file, "r");
+  node_id = read_file.readStringUntil('\n');       //ノードID
+  node_id.trim();
+  longtitude = read_file.readStringUntil('\n');    //前回の最終経度情報
+  longtitude.trim();
+  latitude = read_file.readStringUntil('\n');      //前回の最終緯度情報
+  latitude.trim();
+  read_file.close();
+
+  //加速度センサ初期化シーケンスを実行する
+  set_adxl_resister();
+
+  //DFPlayer Miniとの通信設定，音量設定を行う
+  mp3_set_serial (music_serial);
+  mp3_set_volume (MUSIC_VOLUME);
+
+  return;
+}
+
+
+//ESP-WROOM-02のループシーケンス
+void loop() {
+
+  //蓋開閉検知スイッチがON・衝撃検知フラグがON・実行フラグがON
+  if(digitalRead(SW_INTERRUPT_PIN) == HIGH && impact_flag == true && exe_flag == false){
+    exe_flag = true;                                             //実行フラグを立てる
+    http_access(node_id, longtitude, latitude, "START", true);   //前回記録した最終位置情報を送信する（音声再生有り）
+    delay(3500);                                                 //HTTPの送信完了音声が終わるまで待つ
+    play_voice(TIMING_MUSIC);                                    //心臓マッサージタイミングの支援音を出す
+    delay(100);                                                  //ループ再生設定のための余裕時間
+    mp3_single_loop(true);                                       //現在流しているMP3ファイルをループ再生する
+    impact_flag = false;                                         //衝撃検知フラグを折る
+  }
+
+  //蓋開閉検知スイッチがOFF・実行フラグがON
+  if(digitalRead(SW_INTERRUPT_PIN) == LOW && exe_flag == true){
+    exe_flag = false;                                            //実行フラグを折る
+    http_access(node_id, longtitude, latitude, "END", true);     //今回記録した最終位置情報を送信する（音声再生有り）
+    
+    //ノードIDと前回の最終位置情報をテキストファイルに書き込む
+    File write_file = SPIFFS.open(data_file, "w");
+    write_file.println(node_id);
+    write_file.println(longtitude);
+    write_file.print(latitude);
+    write_file.close();    
+  }
+
+  //定周期タイマー割込みフラグがON・実行フラグがON
+  if(polling_flag == true && exe_flag == true){
+    http_access(node_id, longtitude, latitude, "POLLING", false);  //位置情報を送信する（音声再生無し）
+    polling_flag = false;                                          //定周期タイマー割込みフラグを折る
+  }
+
+  //衝撃検知フラグを立ててから3分が経過・実行フラグがOFF
+  if(polling_counter >= TRESH_TIME){
+    if(exe_flag == false){
+      impact_flag = false;    //衝撃検知フラグを折る
+    }
+    polling_counter = 0;      //ポーリングカウンタを初期化する
+  }
+  
+  //GPS信号の受信処理
+  while(Serial.available() > 0){
+    if(gps.encode(Serial.read())){                           //読み込んだデータをエンコードする
+      if(gps.location.isValid()){                             //有効な位置情報か判断する
+        latitude = String(gps.location.lat(), READ_GPS);      //緯度情報を取得
+        longtitude = String(gps.location.lng(), READ_GPS);    //経度情報を取得        
+      }
+    }
+  }
+
+  //加速度センサの割込みフラグを定期リセットする
+  Wire.requestFrom(ADXL_ADDRESS, READ_ADXL);
+  
+  return;
+}
+/*-------ここまでESP-WROOM-02本体に関する関数-------*/
